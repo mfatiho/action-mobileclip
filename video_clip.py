@@ -1,21 +1,28 @@
 import argparse
-from typing import List, Optional, Sequence, Deque
+import logging
+import os
 from collections import deque
+from pathlib import Path
+from typing import Any, Deque, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
+import open_clip
+from mobileclip.modules.common.mobileone import reparameterize_model
+from open_clip import factory as open_clip_factory
+from mobileclip_loader import load_mobileclip2_s2
 
-try:
-    import cv2  # type: ignore
-    HAS_CV2 = True
-except Exception:  # pragma: no cover
-    HAS_CV2 = False
+logger = logging.getLogger(__name__)
+import cv2
+HAS_CV2 = True
 
+MODEL_NAME = "MobileCLIP2-S2"
 
 def sample_video_frames(video_path: str, num_frames: int) -> List["cv2.Mat"]:
     if not HAS_CV2:
         raise ImportError("OpenCV (opencv-python) is required for video reading.")
+    logger.debug("Opening %s to sample %d frames", video_path, num_frames)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -32,12 +39,14 @@ def sample_video_frames(video_path: str, num_frames: int) -> List["cv2.Mat"]:
         cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
         ok, frame_bgr = cap.read()
         if not ok:
+            logger.warning("Failed to read frame %d from %s", target_idx, video_path)
             continue
         frames.append(frame_bgr)
     cap.release()
 
     if not frames:
         raise RuntimeError("Failed to read any frames from video.")
+    logger.debug("Sampled %d frames from %s", len(frames), video_path)
     return frames
 
 
@@ -55,26 +64,26 @@ def frames_to_tensor(frames_bgr: List["cv2.Mat"], preprocess) -> torch.Tensor:
 
 
 def build_open_clip(
-    model_name: str = "ViT-B-32",
-    pretrained: str = "laion2b_s34b_b79k",
+    model_name: str = MODEL_NAME,
+    pretrained: str = "mobileclip2_s2",
     device: Optional[torch.device] = None,
 ):
-    import open_clip
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
-    tokenizer = open_clip.get_tokenizer(model_name)
-    model.eval().to(device)
-    return model, tokenizer, preprocess, device
+    _ = model_name
+    _ = pretrained
+    model, preprocess, tokenizer, resolved_device = load_mobileclip2_s2(device=device)
+    logit_scale = getattr(model, "logit_scale", None)
+    if logit_scale is None:
+        model.logit_scale = torch.tensor(1.0, device=resolved_device)
+    logger.info("Loaded %s on %s", MODEL_NAME, resolved_device)
+    return model, tokenizer, preprocess, resolved_device
 
 
 def encode_video_and_text(
     video_path: str,
     text: Sequence[str] | str,
     num_frames: int = 8,
-    model_name: str = "ViT-B-32",
-    pretrained: str = "laion2b_s34b_b79k",
+    model_name: str = MODEL_NAME,
+    pretrained: str = "mobileclip2_s2",
     use_amp: bool = True,
 ) -> dict:
     model, tokenizer, preprocess, device = build_open_clip(model_name, pretrained)
@@ -88,6 +97,12 @@ def encode_video_and_text(
         texts = list(text)
 
     tokens = tokenizer(texts).to(device)
+    logger.info(
+        "Encoding %d prompt(s) against %d sampled frames from %s",
+        len(texts),
+        len(frames_bgr),
+        video_path,
+    )
 
     amp_enabled = use_amp and device.type == "cuda"
     amp_dtype = torch.float16 if amp_enabled else torch.float32
@@ -115,7 +130,7 @@ def encode_video_and_text(
         if logit_scale is not None:
             scale = logit_scale.exp()
         else:
-            scale = torch.tensor(1.0, device=device)
+            scale = torch.tensor(100.0, device=device)
         logits_per_image = scale * image_features_avg @ text_features.t()  # [1, num_texts]
         probs = logits_per_image.softmax(dim=-1)  # probabilities over texts
 
@@ -148,6 +163,12 @@ def stream_and_display(
     tokens = tokenizer(list(texts)).to(device)
     amp_enabled = use_amp and device.type == "cuda"
     amp_dtype = torch.float16 if amp_enabled else torch.float32
+    logger.info(
+        "Streaming from %s with %d prompt(s) and window size %d",
+        source,
+        len(texts),
+        num_frames,
+    )
 
     with torch.no_grad():
         if device.type == "cuda":
@@ -159,14 +180,12 @@ def stream_and_display(
         text_features = F.normalize(text_features, dim=-1)
 
     logit_scale = getattr(model, "logit_scale", None)
-    scale = logit_scale.exp() if logit_scale is not None else torch.tensor(1.0, device=device)
+    scale = logit_scale.exp() if logit_scale is not None else torch.tensor(100.0, device=device)
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open source: {source}")
-
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
+    
     # Sliding window over per-frame features
     feature_queue: Deque[torch.Tensor] = deque()
     sum_features: Optional[torch.Tensor] = None  # shape [1, D]
@@ -177,7 +196,6 @@ def stream_and_display(
             ok, frame = cap.read()
             if not ok:
                 break
-
             # Encode single frame to a feature vector (1, D)
             frame_tensor = frames_to_tensor([frame], preprocess).to(device)
             with torch.no_grad():
@@ -208,6 +226,21 @@ def stream_and_display(
                 probs = logits.softmax(dim=-1)[0]
                 top_idx = int(torch.argmax(probs).item())
                 current_top = (texts[top_idx], float(probs[top_idx].item()))
+                logger.debug(
+                    "Top prediction %s with probability %.3f",
+                    current_top[0],
+                    current_top[1],
+                )
+
+            # Calculate current playback time (seconds)
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if pos_msec and pos_msec > 0:
+                seconds = float(pos_msec) / 1000.0
+            else:
+                # Fallback to frame index / fps
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+                frame_idx = cap.get(cv2.CAP_PROP_POS_FRAMES) or 0.0
+                seconds = (frame_idx / fps) if fps > 1e-3 else 0.0
 
             # Overlay current prediction
             if current_top is not None:
@@ -215,9 +248,9 @@ def stream_and_display(
                 text = f"{label}: {p:.2f}"
                 cv2.rectangle(frame, (8, 8), (8 + 8 + 6 * len(text), 40), (0, 0, 0), thickness=-1)
                 cv2.putText(frame, text, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-
-            cv2.imshow(window_name, frame)
-            # 1ms wait; quit with 'q'
+                time_str = f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+                logger.info("Prediction=%s prob=%.3f time=%s", label, p, time_str)
+            # cv2.imshow(window_name, frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
@@ -232,12 +265,23 @@ if __name__ == "__main__":
     parser.add_argument("video", type=str, help="Video path or camera index (e.g., 0)")
     parser.add_argument("prompt", type=str, help="Text prompt (fallback if --texts not given)")
     parser.add_argument("--texts", type=str, nargs="*", default=None, help="One or more text prompts")
-    parser.add_argument("--frames", type=int, default=8, help="Number of frames per chunk")
-    parser.add_argument("--model", type=str, default="ViT-B-32")
-    parser.add_argument("--pretrained", type=str, default="laion2b_s34b_b79k")
+    parser.add_argument("--frames", type=int, default=16, help="Number of frames per chunk")
+    parser.add_argument("--model", type=str, default=MODEL_NAME)
+    parser.add_argument("--pretrained", type=str, default="mobileclip2_s2")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision on CUDA")
     parser.add_argument("--stream", action="store_true", help="Process as a live stream and display online")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level (e.g. DEBUG, INFO, WARNING).",
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     texts_cli = args.texts if args.texts is not None else [args.prompt]
 
